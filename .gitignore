@@ -1,3 +1,5 @@
 .env
 trades_live/
 whale_detector.log
+signs.md
+how_to_push.md
