@@ -5,6 +5,21 @@ Basado en definitive_all_claude.py con filtros avanzados de señales (S1-S8),
 whitelists/blacklists de traders, resolución de conflictos y warnings.
 
 CHANGELOG:
+  v7.6.3 (Apr 2026) — Auditoría completa keywords + validación cruce Whales/Gold (38 días producción):
+    HALLAZGOS CROSS-SYSTEM (no cambian lógica, documentados para re-evaluaciones futuras):
+    - S2+: 7 activaciones, 6 resueltas, WR 100%, PnL +$192. Confirmada mejor señal del sistema.
+      Bottleneck: requiere que cada whale del consenso pase el scraper individual. Arquitectura correcta.
+    - S6 (desactivada): Gold N=22 muestra WR 59.1% — mismo artefacto estadístico que N=516 pre-v7.6.
+      Split por subranges invierte diseño original: LOW 0.40-0.46 WR 63.2% > MEDIUM 0.46-0.50 WR 33.3%.
+      Mantenida desactivada. Re-evaluar SOLO subzona 0.40-0.46 cuando N≥50 con WR counter ≥60%.
+    - S2B: zona 0.65-0.70 (MEDIUM) tiene avg_capital whale estructuralmente mayor (~$11K vs ~$9K en 0.70+).
+      El capital elevado del whale NO indica más confianza — respetar Kelly stake ×2 vs ×3 (HIGH).
+    - S2 HIGH vs MEDIUM: inversión de capital ($24K avg MEDIUM vs $8.7K HIGH) es artefacto de datos
+      pre-v7.6.1 donde HIGH RISK activaba MEDIUM. Con v7.6.1 (solo RISKY) este problema se auto-corrige.
+    - S10: 14 activaciones, 0 resueltas (mercados abiertos). avg_capital $19.2K. No evaluar hasta N≥15 resueltos.
+    - Validación S2+ diseño colectivo: cruce "Clippers vs Warriors" 02-Mar confirma que consenso
+      multi-whale activa señal correctamente incluso cuando un whale individual está en blacklist.
+
   v7.6.3 (Apr 2026) — Auditoría completa keywords de categorías:
     - NHL: FIX CRÍTICO — 'rangers' eliminado de NHL_KEYWORDS, reemplazado por 'new york rangers'.
       'rangers' estaba en AMBAS listas (NHL + SOCCER). Como NHL va primero en _detect_category,
@@ -966,7 +981,10 @@ def classify(
             confidence = "MEDIUM"
             wr_s2b = 78.6 if 'HIGH RISK' not in tier_upper else 69.6
             _hr_note = " (HR 0.65-0.70 WR 69.6%, N=23)" if 'HIGH RISK' in tier_upper else ""
-            reasoning = f"S2B zona baja: Follow NBA a {poly_price:.2f} (WR {wr_s2b:.1f}%{_hr_note}, rango 0.65-0.70, excl. BOT)"
+            # NOTA: ballenas en 0.65-0.70 tienen avg_capital estructuralmente mayor que en 0.70+
+            # (~$11K vs ~$9K en producción Gold). El capital del whale NO indica mayor confianza
+            # aquí — la zona sigue siendo MEDIUM (stake ×2). Respetar Kelly, no escalar por capital whale.
+            reasoning = f"S2B zona baja: Follow NBA a {poly_price:.2f} (WR {wr_s2b:.1f}%{_hr_note}, rango 0.65-0.70, excl. BOT) [stake ×2 — respetar sizing]"
 
         if display_name_lower in whitelist_a_lower:
             reasoning += f" | Whitelist A ({display_name}) → stake 1.5x"
@@ -1092,7 +1110,13 @@ def classify(
     # v7.6: INVALIDADO con N=2062 Whales. Ballenas en esta zona WR follow 58.5% (N=41).
     # Counter solo gana 41.5% → PnL negativo para counter. Señal destruida por dataset masivo.
     # Antes (N=516): aparente WR counter 59.1% era artefacto de muestra pequeña.
-    # No reimplementar hasta nuevo análisis con N≥50 exclusivos en esta zona con WR counter ≥60%.
+    # Gold producción (N=22 total, Apr 2026): S6 aparece con WR 59.1% — mismo artefacto que N=516.
+    #   El 59% reaparece con N pequeño cada vez y desaparece con N masivo. No reactivar por este dato.
+    # HALLAZGO PARA RE-EVALUACIÓN FUTURA: en Gold, el split por subranges es inverso al diseño:
+    #   S6 LOW (0.40-0.46): WR 63.2%, PnL +$845 (N≈19) — la zona "peor" performa mejor.
+    #   S6 MEDIUM (0.46-0.50): WR 33.3%, PnL -$59 (N≈3) — la zona "mejor" performa peor.
+    #   Si se reactiva, evaluar SOLO la subzona 0.40-0.46 con N≥30 y WR counter ≥60% sostenido.
+    # No reimplementar hasta N≥50 exclusivos en zona 0.40-0.46 con WR counter ≥60%.
     # if category == "ESPORTS" and 0.40 <= poly_price < 0.50:
     #     if poly_price >= 0.46:
     #         confidence_s6 = "MEDIUM"
@@ -1448,9 +1472,9 @@ def classify_consensus(
     if category != "NBA":
         return {"signal_id": "NONE", "action": "IGNORE", "reasoning": ["S2+ solo aplica a NBA"]}
 
-    if len(whale_entries) < 3:
+    if len(whale_entries) < 2:
         return {"signal_id": "NONE", "action": "IGNORE",
-                "reasoning": [f"Solo {len(whale_entries)} ballenas, necesita 3+ para S2+"]}
+                "reasoning": [f"Solo {len(whale_entries)} ballenas, necesita 2+ para S2+"]}
 
     # Agrupar por lado
     sides = {}
@@ -1460,9 +1484,9 @@ def classify_consensus(
             sides[s] = []
         sides[s].append(entry)
 
-    # Buscar lado con 3+ ballenas
+    # Buscar lado con 2+ ballenas
     for side_key, entries in sides.items():
-        if len(entries) >= 3:
+        if len(entries) >= 2:
             prices = [e["poly_price"] for e in entries]
             avg_price = sum(prices) / len(prices)
 
@@ -1641,9 +1665,10 @@ class ConsensusTracker:
         return False, 0, '', 0
 
     def get_whale_entries(self, market_id):
-        """Retorna las entradas de ballenas para evaluación S2+."""
+        """Retorna las entradas de ballenas para evaluación S2+, excluyendo BLACKLIST."""
         self._cleanup(market_id)
         entries = self.trades.get(market_id, [])
+        _blacklist_set = {b.lower() for b in BLACKLIST}
         return [
             {
                 'side': e['side'],
@@ -1652,6 +1677,7 @@ class ConsensusTracker:
                 'display_name': e['display_name'],
             }
             for e in entries
+            if e.get('display_name', '').lower() not in _blacklist_set
         ]
 
 
@@ -2227,8 +2253,8 @@ class GoldWhaleDetector:
             dynamic_whitelist=self.dynamic_whitelist,
         )
 
-        # Evaluar S2+ y S1+ si hay consenso de 3+
-        if is_consensus and count >= 3:
+        # Evaluar S2+ y S1+ si hay consenso de 2+
+        if is_consensus and count >= 2:
             whale_entries = self.consensus.get_whale_entries(condition_id)
 
             # S2+: Follow NBA consensus 0.50-0.60
@@ -2561,6 +2587,9 @@ class GoldWhaleDetector:
                     if not silent:
                         send_telegram_notification(msg_sin_perfil)
                     logger.info(f"Sin perfil en analytics para {display_name} ({wallet[:10]}...)")
+                    # Desbloquear wallet: el scrape falló por error transitorio (red/Xvfb),
+                    # no porque hayamos analizado al trader — permitir reintento si reaparece.
+                    self._wallets_analizadas.discard(wallet)
                     return
 
                 # Completar campos que el scraper pudo no capturar por timeout de JS (<1s)
